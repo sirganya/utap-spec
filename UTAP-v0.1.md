@@ -2160,10 +2160,39 @@ specified duration before retrying.
 
 ## 14. Transport Binding
 
-### 14.1 HTTP/JSON Binding (Normative)
+### 14.1 Transport-Agnostic Credential
+
+The HMAC-SHA256 token credential (Section 6.4) is the canonical portable
+payment unit in UTAP. Because the credential is **self-verifying** -- the CFP
+can confirm its integrity regardless of how it arrived -- the protocol does
+not require transport-level integrity protection for credential exchange
+between agents.
+
+This decouples two concerns:
+
+- **Agent-to-CFP communication** (minting, validation, transfer, burn) MUST
+  use authenticated, encrypted channels (HTTPS). These are API calls carrying
+  JWTs and sensitive token state.
+- **Agent-to-agent credential exchange** (the payment URI or credential
+  string) MAY use any transport capable of carrying 43 characters of
+  base64url data. The credential's tamper-proof property means the transport
+  does not need to guarantee integrity.
+
+The remaining transport risk for credential exchange is **replay**: an
+attacker who intercepts a credential can attempt to present it before the
+legitimate recipient. This is mitigated by:
+
+- **Single-use burn:** The first successful transfer consumes the token.
+- **Short TTL:** Tokens expire within 1 hour by default.
+- **PA authentication:** Only an authenticated PA can request a transfer.
+  Intercepting the credential alone is not sufficient.
+- **Confidential transports RECOMMENDED:** Despite these mitigations,
+  encrypted transport SHOULD be used where available to reduce replay risk.
+
+### 14.2 HTTP/JSON Binding (Normative)
 
 This specification defines a normative binding for HTTP/1.1 and HTTP/2 with
-JSON request and response bodies.
+JSON request and response bodies for agent-to-CFP communication.
 
 **Base URL:** `https://{cfp-host}/cfp/v1/`
 
@@ -2175,7 +2204,7 @@ endpoints.
 **API versioning:** URL path segment (`/v1/`). Future versions will use `/v2/`,
 etc. The CFP SHOULD support at least one prior version during transitions.
 
-### 14.2 Endpoint Summary
+### 14.3 Endpoint Summary
 
 | Method | Path                              | Auth | Description                  |
 |--------|-----------------------------------|------|------------------------------|
@@ -2201,7 +2230,7 @@ etc. The CFP SHOULD support at least one prior version during transitions.
 *Agent registration authenticates via delegation tokens in the request body,
 not via JWT header.
 
-### 14.3 CORS
+### 14.4 CORS
 
 CFP implementations that serve browser-based agents MUST support CORS with:
 
@@ -2209,17 +2238,243 @@ CFP implementations that serve browser-based agents MUST support CORS with:
 - `Access-Control-Allow-Headers: Content-Type, Authorization, Idempotency-Key`
 - `Access-Control-Allow-Origin:` configured per deployment
 
-### 14.4 Future Transport Bindings (Informative)
+### 14.5 Agent-to-Agent Credential Transport
 
-Future versions of this specification MAY define bindings for:
+The following transports are suitable for exchanging token credentials between
+agents. The credential is the base64url-encoded HMAC string (43 characters).
+In all cases, the agent-to-CFP communication (validation, transfer, burn)
+continues to use the HTTP/JSON binding defined in Section 14.2.
 
-- **gRPC:** For high-performance agent-to-CFP communication with streaming
-  support and strongly-typed message definitions.
-- **WebSocket:** For bidirectional real-time communication, extending the
-  event notification mechanism defined in Section 8.10.
-- **MQTT:** For constrained IoT agents with limited bandwidth and compute.
+#### 14.5.1 Message Queues (Normative)
 
-These bindings are informative and are not part of the v0.1 specification.
+Agents operating within message-oriented architectures (Kafka, NATS,
+RabbitMQ, Amazon SQS, Google Pub/Sub) MAY exchange credentials as message
+payloads.
+
+**Credential message format:**
+
+```json
+{
+  "utap_version": "0.1",
+  "utap_credential": "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+  "utap_amount": "1500.00",
+  "utap_currency": "USD",
+  "utap_purpose": "compute",
+  "utap_ref": "gpu-quote-8821"
+}
+```
+
+This format mirrors the URI query parameters as JSON fields, enabling the
+same payment request/response flow (Section 7.3) over message queues.
+
+**Requirements:**
+
+- The message queue SHOULD provide at-least-once delivery. UTAP's
+  idempotency mechanism (Section 11) handles duplicate delivery safely.
+- The message queue SHOULD provide encryption in transit. While credential
+  integrity does not depend on transport encryption, confidentiality reduces
+  replay risk.
+- Agents MUST still authenticate with the CFP via HTTPS for all token
+  lifecycle operations.
+
+**Payment flow over message queue:**
+
+```
+PA                     Message Queue              RA
+ |                          |                      |
+ |-- Publish: payment   --->|                      |
+ |   request message        |----> Deliver ------->|
+ |   (credential=NEW)       |                      |
+ |                          |                      |
+ |                          |    [RA mints via CFP] |
+ |                          |                      |
+ |                          |<---- Publish --------|
+ |<-- Deliver: payment  ---|    response message   |
+ |   (credential=dBjf...)   |                      |
+ |                          |                      |
+ |  [PA validates via CFP]  |                      |
+ |  [PA transfers via CFP]  |                      |
+ |  [PA burns via CFP]      |                      |
+```
+
+#### 14.5.2 gRPC (Normative)
+
+For high-throughput agent pipelines, credentials MAY be exchanged via gRPC
+unary calls or bidirectional streams.
+
+**Credential exchange service definition:**
+
+```protobuf
+syntax = "proto3";
+
+package utap.transport.v1;
+
+message PaymentRequest {
+  string utap_version = 1;
+  string utap_amount = 2;
+  string utap_currency = 3;
+  string utap_purpose = 4;
+  string utap_ref = 5;
+}
+
+message PaymentCredential {
+  string utap_version = 1;
+  string utap_credential = 2;
+}
+
+service AgentPayment {
+  // Single payment: PA sends request, RA returns credential
+  rpc RequestPayment(PaymentRequest) returns (PaymentCredential);
+
+  // Streaming: for micro-payment pipelines where one agent makes
+  // many sequential payments (e.g., per-inference billing)
+  rpc StreamPayments(stream PaymentRequest) returns (stream PaymentCredential);
+}
+```
+
+**Requirements:**
+
+- gRPC channels between agents SHOULD use TLS.
+- The `StreamPayments` RPC enables high-frequency micro-payment flows where
+  latency matters. Each credential in the stream is independently validated
+  and burned via the CFP.
+- Agents MUST still use the HTTP/JSON binding for CFP communication.
+
+#### 14.5.3 WebSocket (Normative)
+
+Agents MAY exchange credentials over persistent WebSocket connections. This
+is suitable for long-running agent sessions with multiple payments.
+
+**Message format (JSON over WebSocket):**
+
+```json
+{
+  "type": "payment_request",
+  "utap_version": "0.1",
+  "utap_amount": "1.00",
+  "utap_currency": "USD",
+  "utap_purpose": "model-inference",
+  "request_id": "req-001"
+}
+```
+
+```json
+{
+  "type": "payment_credential",
+  "utap_credential": "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+  "request_id": "req-001"
+}
+```
+
+The `request_id` field correlates requests with responses over the
+multiplexed connection.
+
+**Requirements:**
+
+- WebSocket connections MUST use `wss://` (TLS).
+- Agents SHOULD implement heartbeat/ping to detect stale connections.
+
+#### 14.5.4 MQTT (Normative)
+
+For constrained IoT agents (robots, sensors, embedded devices), credentials
+MAY be exchanged via MQTT publish/subscribe.
+
+**Topic structure:**
+
+```
+utap/payments/{agent_id}/requests    -- PA publishes payment requests
+utap/payments/{agent_id}/credentials -- RA publishes credentials
+```
+
+**Payload:** The credential message JSON format defined in Section 14.5.1,
+or the bare credential string for minimal payloads.
+
+**Requirements:**
+
+- MQTT brokers SHOULD require TLS (port 8883).
+- QoS level 1 (at-least-once) is RECOMMENDED. UTAP's idempotency mechanism
+  handles duplicate delivery.
+- For extremely constrained devices, the bare credential string (43 bytes)
+  MAY be sent as the payload without JSON wrapping. The receiving agent
+  infers the payment context from the topic.
+
+#### 14.5.5 QR Code / Visual (Normative)
+
+Credentials MAY be encoded in QR codes for physical-world agent interactions:
+kiosks, point-of-sale terminals, digital signage, or mobile agent apps.
+
+**QR content:**
+
+The full payment URI (Section 7.1) is encoded as the QR payload:
+
+```
+https://cfp.example.com/pay?utap_credential=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk&utap_version=0.1
+```
+
+The tamper-proof credential means the QR code can be safely:
+
+- Displayed on a screen (the image could be photographed by a bystander, but
+  single-use burn prevents replay after the first claim).
+- Printed on paper (physical receipts, invoices, packaging).
+- Transmitted via screen-to-camera capture across air-gapped systems.
+
+#### 14.5.6 NFC (Normative)
+
+Credentials MAY be exchanged via NFC Data Exchange Format (NDEF) for
+tap-to-pay interactions between physical devices.
+
+**NDEF record:**
+
+- Type: URI record (`urn:nfc:wkt:U`)
+- Payload: The payment URI from Section 7.1
+
+At 43 characters for the credential plus URI overhead (~100 bytes total), the
+payload fits within a single NFC tap exchange.
+
+**Use cases:**
+
+- A delivery robot taps a warehouse terminal to pay for storage.
+- A mobile agent app taps a vendor terminal to complete a purchase.
+- An autonomous vehicle taps a charging station.
+
+#### 14.5.7 SMS / Messaging (Informative)
+
+Credentials MAY be transmitted via SMS, email, or messaging APIs (Slack,
+WhatsApp Business, etc.) for asynchronous agent workflows.
+
+The credential is tamper-proof, so the messaging channel does not need to
+guarantee integrity. However, these channels typically offer weak
+confidentiality guarantees, increasing replay risk. Implementations using
+messaging transports SHOULD:
+
+- Use the shortest practical TTL for tokens.
+- Prefer channels with end-to-end encryption where available.
+- Consider the `HELD` state (Section 8.5) to lock the token immediately
+  upon receipt, narrowing the replay window.
+
+### 14.6 Transport Security Summary
+
+| Transport              | Integrity   | Confidentiality | Replay Protection      |
+|------------------------|-------------|-----------------|------------------------|
+| HTTPS (URI)            | TLS + HMAC  | TLS             | Burn + TTL + PA auth   |
+| Message Queue (TLS)    | HMAC        | TLS             | Burn + TTL + PA auth   |
+| gRPC (TLS)             | HMAC        | TLS             | Burn + TTL + PA auth   |
+| WebSocket (WSS)        | HMAC        | TLS             | Burn + TTL + PA auth   |
+| MQTT (TLS)             | HMAC        | TLS             | Burn + TTL + PA auth   |
+| QR Code                | HMAC        | None*           | Burn + TTL + PA auth   |
+| NFC                    | HMAC        | Proximity**     | Burn + TTL + PA auth   |
+| SMS / Messaging        | HMAC        | Varies          | Burn + TTL + PA auth   |
+
+*QR codes are visually exposed. Confidentiality relies on physical access
+control (e.g., displaying the QR only to the intended recipient).
+
+**NFC provides inherent confidentiality through short range (~4cm), making
+interception impractical without physical proximity.
+
+In all cases, **integrity is provided by the HMAC credential** regardless of
+transport. Confidentiality and replay protection vary by transport and are
+supplemented by protocol-level mechanisms (single-use burn, short TTL, PA
+authentication for transfer).
 
 ---
 
