@@ -601,20 +601,27 @@ A token is a JSON object with the following fields:
 A token progresses through the following states:
 
 ```
-                  +--------+
-                  | MINTED |
-                  +---+----+
-                      |
-         +------------+------------+
-         |            |            |
-         v            v            v
-      +------+   +---------+  +---------+
-      | HELD |   | EXPIRED |  | REVOKED |
-      +--+---+   +---------+  +---------+
++------------------+
+| PENDING_APPROVAL |
++--------+---------+
          |
-    +----+----+
-    |         |
-    v         v
+    approve / reject
+         |         \
+         v          v
+    +--------+  +---------+
+    | MINTED |  | REVOKED |
+    +---+----+  +---------+
+        |
+        +------------+------------+
+        |            |            |
+        v            v            v
+     +------+   +---------+  +---------+
+     | HELD |   | EXPIRED |  | REVOKED |
+     +--+---+   +---------+  +---------+
+        |
+   +----+----+
+   |         |
+   v         v
 +-------------+  +---------+
 | TRANSFERRED |  | REVOKED |
 +------+------+  +---------+
@@ -624,6 +631,12 @@ A token progresses through the following states:
   | BURNED |
   +--------+
 ```
+
+**PENDING_APPROVAL:** The minting request exceeded the `requires_approval_above`
+threshold (Section 10.5) or the transfer exceeded the PA's `requires_review_above`
+threshold (Section 10.6.2). The token exists but cannot be used in a payment URI
+or transferred until a Principal approves. If rejected, the token moves to
+REVOKED and the budget is credited back.
 
 **MINTED:** The token has been created and assigned to the RA. The RA's budget
 has been debited. The token is ready to be used in a payment URI.
