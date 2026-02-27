@@ -2787,6 +2787,10 @@ etc. The CFP SHOULD support at least one prior version during transitions.
 | GET    | `/cfp/v1/audit/budgets/{scope}`   | Yes  | Get audit trail for budget   |
 | GET    | `/cfp/v1/budgets/{scope}`         | Yes  | Get budget status            |
 | PUT    | `/cfp/v1/budgets/{scope}`         | Yes  | Create/update budget         |
+| GET    | `/cfp/v1/receiving-policy/{aid}`  | Yes  | Get PA receiving policy      |
+| PUT    | `/cfp/v1/receiving-policy/{aid}`  | Yes  | Create/update receiving policy |
+| GET    | `/cfp/v1/settlements`             | Yes  | Query settlement instructions |
+| GET    | `/cfp/v1/settlements/reconciliation` | Yes | Settlement reconciliation report |
 | GET    | `/cfp/v1/events`                  | Yes  | WebSocket event stream       |
 
 *Agent registration authenticates via delegation tokens in the request body,
