@@ -797,7 +797,7 @@ The `currency` field MUST be a valid ISO 4217 alphabetic code. Implementations
 MUST support at least `USD`, `EUR`, and `GBP`. The CFP MAY support additional
 currencies.
 
-### 6.5 Token Expiration
+### 6.6 Token Expiration
 
 Every token MUST have an `expires_at` field set at minting time. The default
 TTL SHOULD be 1 hour. The CFP MUST reject any operation on an expired token
@@ -806,7 +806,7 @@ with a `TOKEN_EXPIRED` error (HTTP 410).
 The CFP SHOULD periodically evict expired tokens from active storage. Expired
 tokens MUST remain in the audit log.
 
-### 6.6 Purpose Binding
+### 6.7 Purpose Binding
 
 The `purpose` object is set at minting time and is **immutable** -- it MUST NOT
 be modified after the token is created. This ensures that audit records
