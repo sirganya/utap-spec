@@ -1285,28 +1285,276 @@ After burning, the token is permanently consumed. The `settlement` field
 indicates the status of the actual fund movement, which is handled by the
 settlement layer (outside the scope of this specification).
 
-### 8.8 Settlement (Informative)
+### 8.8 Settlement
 
-Settlement -- the actual movement of money between accounts -- is outside the
-normative scope of UTAP. The protocol defines the trigger (a token reaching
-`BURNED` status) and the audit record format, but the settlement mechanism is
-pluggable.
+Settlement is the actual movement of money between accounts. UTAP does not
+mandate a specific payment rail -- the rail is pluggable -- but the protocol
+defines normative requirements for how the CFP triggers, tracks, and reports
+settlement so that finance teams have a consistent interface regardless of the
+underlying mechanism.
 
-Common settlement approaches:
+#### 8.8.1 Settlement Trigger
 
-- **Internal ledger:** For agents within the same organization, the CFP
-  simply adjusts account balances. No external transfer needed.
-- **Batch ACH/wire:** The CFP aggregates burned tokens and initiates periodic
-  batch transfers between organizations.
-- **Real-time payment rails:** Integration with FedNow, SEPA Instant, or
-  similar systems for cross-org settlement.
-- **Stablecoin:** Settlement via on-chain stablecoin transfer for
-  organizations that prefer blockchain-based finality.
+The CFP MUST create a **Settlement Instruction** when a token reaches the
+`BURNED` state. This is atomic with the burn -- if the burn succeeds, a
+settlement instruction MUST exist.
 
-The CFP SHOULD expose a settlement status API:
+A settlement instruction is also created when a token reaches `EXPIRED` or
+`REVOKED` from `MINTED` or `HELD`, but in these cases the instruction
+represents a **credit back** to the RA's funding source rather than a transfer
+to the PA.
+
+#### 8.8.2 Settlement Instruction Object
+
+```json
+{
+  "settlement_id": "stl-7f3a9c01-e4b2-4d8a-b6c1-9e2f0a3d5b7c",
+  "token_id": "550e8400-e29b-41d4-a716-446655440000",
+  "type": "TRANSFER",
+  "from": {
+    "agent_id": "utap:agent:acme.com:purchasing-bot-7",
+    "organization": "acme.com",
+    "funding_account": "acme-ops-usd-001"
+  },
+  "to": {
+    "agent_id": "utap:agent:cloudco.com:billing-agent",
+    "organization": "cloudco.com",
+    "funding_account": "cloudco-receivables-usd-001"
+  },
+  "amount": {
+    "value": "150.00",
+    "currency": "USD"
+  },
+  "status": "PENDING",
+  "rail": "internal_ledger",
+  "created_at": "2026-02-26T10:06:00Z",
+  "settled_at": null,
+  "failed_at": null,
+  "external_reference": null,
+  "batch_id": null,
+  "token_burned_at": "2026-02-26T10:06:00Z",
+  "purpose": {
+    "category": "compute",
+    "description": "GPU instance rental - 2 hours"
+  }
+}
+```
+
+| Field                | Type     | Description                                          |
+|----------------------|----------|------------------------------------------------------|
+| `settlement_id`      | string   | Unique ID (`stl-` prefix + UUID v4).                 |
+| `token_id`           | string   | The burned token that triggered this instruction.    |
+| `type`               | string   | `TRANSFER` (PA receives funds) or `CREDIT_BACK` (RA refund on expiry/revocation). |
+| `from` / `to`        | object   | Agent ID, organization, and funding account reference for each side. |
+| `amount`             | object   | Decimal string value and ISO 4217 currency.          |
+| `status`             | string   | Settlement lifecycle state (see 8.8.3).              |
+| `rail`               | string   | The settlement mechanism used (see 8.8.4).           |
+| `created_at`         | string   | ISO 8601 timestamp of instruction creation.          |
+| `settled_at`         | string   | ISO 8601 timestamp when funds were confirmed moved. Null until `SETTLED`. |
+| `failed_at`          | string   | ISO 8601 timestamp if settlement failed. Null unless `FAILED`. |
+| `external_reference` | string   | Rail-specific reference (e.g., ACH trace number, wire IMAD, on-chain tx hash). Null until available. |
+| `batch_id`           | string   | If this instruction was settled as part of a batch, the batch identifier. |
+| `purpose`            | object   | Copied from the token for reconciliation.            |
+
+#### 8.8.3 Settlement Lifecycle
 
 ```
-GET /cfp/v1/settlements?token_id=550e8400-...
++----------+     +-----------+     +---------+
+| PENDING  |---->| EXECUTING |---->| SETTLED |
++----+-----+     +-----+-----+     +---------+
+     |                  |
+     v                  v
++-----------+     +--------+     +----------+
+| BATCHED   |     | FAILED |---->| RETRYING |--+
++-----------+     +--------+     +----+-----+  |
+     |                                |         |
+     v                                +---------+
++-----------+                                |
+| EXECUTING |                                v
++-----------+                           +--------+
+                                        | FAILED |
+                                        +--------+
+```
+
+| State       | Description                                                     |
+|-------------|----------------------------------------------------------------|
+| `PENDING`   | Instruction created. Awaiting settlement processing.            |
+| `BATCHED`   | Instruction assigned to a settlement batch. Awaiting batch execution. |
+| `EXECUTING` | Fund transfer initiated on the underlying rail.                 |
+| `SETTLED`   | Funds confirmed received. Terminal state.                       |
+| `FAILED`    | Settlement attempt failed. See `failure_reason`.                |
+| `RETRYING`  | A failed instruction being retried. Includes retry count.       |
+
+The CFP MUST NOT leave a settlement instruction in `PENDING` indefinitely. The
+CFP MUST define a maximum settlement window (e.g., T+1 for batch ACH, near-
+instant for internal ledger). If settlement has not completed within the
+window, the CFP MUST move the instruction to `FAILED` and trigger an alert.
+
+A `FAILED` instruction MUST NOT silently disappear. The CFP MUST retain it for
+audit and MUST notify both the RA's and PA's controlling Principals.
+
+#### 8.8.4 Settlement Rails
+
+The settlement rail is configured per organization pair on the CFP. UTAP does
+not mandate a specific rail but requires the CFP to report which rail is in
+use.
+
+| Rail                | `rail` value          | Typical latency | Description                                   |
+|---------------------|-----------------------|-----------------|-----------------------------------------------|
+| Internal ledger     | `internal_ledger`     | < 1 second      | Both parties on the same CFP. Balance adjustment only. |
+| Batch ACH           | `ach_batch`           | T+1 to T+2      | CFP aggregates instructions into ACH files.   |
+| Wire transfer       | `wire`                | Same day         | Individual SWIFT/Fedwire transfers.           |
+| Real-time payments  | `rtp`                 | < 10 seconds     | FedNow, SEPA Instant, UK Faster Payments.     |
+| Stablecoin          | `stablecoin`          | < 5 minutes      | On-chain USDC/USDT or equivalent.             |
+| Custom              | `custom:<identifier>` | Varies           | Organization-specific settlement mechanism.    |
+
+For cross-organization settlement, the CFP MUST maintain **funding accounts**
+-- references to the external accounts from which funds are drawn (RA side)
+and into which funds are deposited (PA side). Funding account configuration is
+an administrative operation outside the agent-facing API.
+
+#### 8.8.5 Settlement Netting
+
+For organization pairs with high transaction volume, the CFP SHOULD support
+**bilateral netting**: rather than settling each burned token individually, the
+CFP aggregates all instructions between two organizations over a netting
+window and settles only the net amount.
+
+```
+Netting window: 24 hours (configurable per org pair)
+
+  Acme -> CloudCo:   $12,400 (83 tokens)
+  CloudCo -> Acme:    $3,100 (12 tokens)
+  ---
+  Net: Acme -> CloudCo: $9,300 (1 settlement)
+```
+
+The CFP MUST record the individual token-to-settlement mapping so that each
+burned token can be traced to its settlement instruction, even when netted.
+
+#### 8.8.6 Settlement Status API
+
+**Query by token:**
+
+```http
+GET /cfp/v1/settlements?token_id=550e8400-e29b-41d4-a716-446655440000 HTTP/1.1
+Host: cfp.example.com
+Authorization: Bearer <agent-jwt>
+```
+
+**Query by organization (principal only):**
+
+```http
+GET /cfp/v1/settlements?organization=acme.com&status=PENDING&limit=50 HTTP/1.1
+Host: cfp.example.com
+Authorization: Bearer <principal-jwt>
+```
+
+**Query by date range:**
+
+```http
+GET /cfp/v1/settlements?from=2026-02-01&to=2026-02-28&rail=ach_batch HTTP/1.1
+Host: cfp.example.com
+Authorization: Bearer <principal-jwt>
+```
+
+**Response:**
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "settlements": [
+    {
+      "settlement_id": "stl-7f3a9c01-e4b2-4d8a-b6c1-9e2f0a3d5b7c",
+      "token_id": "550e8400-e29b-41d4-a716-446655440000",
+      "type": "TRANSFER",
+      "amount": { "value": "150.00", "currency": "USD" },
+      "status": "SETTLED",
+      "rail": "internal_ledger",
+      "created_at": "2026-02-26T10:06:00Z",
+      "settled_at": "2026-02-26T10:06:01Z",
+      "external_reference": null
+    }
+  ],
+  "pagination": {
+    "total": 1,
+    "offset": 0,
+    "limit": 50,
+    "has_more": false
+  }
+}
+```
+
+#### 8.8.7 Settlement Reconciliation
+
+The CFP MUST support reconciliation between the UTAP audit ledger and
+settlement records. For every token in `BURNED` state, exactly one settlement
+instruction of type `TRANSFER` MUST exist. For every token in `EXPIRED` or
+`REVOKED` state that was previously `MINTED` or `HELD`, exactly one settlement
+instruction of type `CREDIT_BACK` MUST exist.
+
+**Reconciliation endpoint:**
+
+```http
+GET /cfp/v1/settlements/reconciliation?from=2026-02-01&to=2026-02-28 HTTP/1.1
+Host: cfp.example.com
+Authorization: Bearer <principal-jwt>
+```
+
+**Response:**
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "period": {
+    "from": "2026-02-01T00:00:00Z",
+    "to": "2026-02-28T23:59:59Z"
+  },
+  "summary": {
+    "tokens_burned": 1247,
+    "tokens_expired": 33,
+    "tokens_revoked": 8,
+    "settlements_completed": 1247,
+    "credits_completed": 41,
+    "settlements_pending": 0,
+    "settlements_failed": 0,
+    "total_settled": { "value": "284930.00", "currency": "USD" },
+    "total_credited_back": { "value": "4120.00", "currency": "USD" }
+  },
+  "unmatched": [],
+  "status": "RECONCILED"
+}
+```
+
+If `unmatched` is non-empty, each entry contains a token ID and the nature of
+the discrepancy (e.g., `burned_no_settlement`, `settlement_no_burn`). The CFP
+MUST surface unmatched entries as alerts to administrators.
+
+#### 8.8.8 Settlement and Audit Integration
+
+Every settlement state transition MUST produce an audit record (Section 9)
+appended to the token's audit chain. This means a fully settled token has an
+unbroken chain from `MINTED` through `BURNED` through `SETTLED`, all
+verifiable via the hash chain.
+
+The `settlement_id` MUST appear in the audit record's `metadata` field,
+linking the two systems:
+
+```json
+{
+  "event": "SETTLEMENT_COMPLETED",
+  "token_id": "550e8400-e29b-41d4-a716-446655440000",
+  "timestamp": "2026-02-26T10:06:01Z",
+  "metadata": {
+    "settlement_id": "stl-7f3a9c01-e4b2-4d8a-b6c1-9e2f0a3d5b7c",
+    "rail": "internal_ledger",
+    "external_reference": null
+  }
+}
 ```
 
 ### 8.9 Batch Operations
