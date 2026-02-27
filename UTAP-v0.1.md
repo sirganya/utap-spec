@@ -1840,6 +1840,235 @@ Content-Type: application/json
 5. Upon rejection, the token moves to `REVOKED` status and the budget is
    credited back.
 
+### 10.6 Receiving Policy (PA-Side Controls)
+
+Sections 10.1 -- 10.5 govern *outbound* spending by Requesting Agents. This
+section defines the symmetric controls for *inbound* receiving by Providing
+Agents. Both sets of controls are enforced by the CFP.
+
+#### 10.6.1 Receiving Policy Object
+
+A receiving policy is bound to a PA's Agent Identifier. A PA MAY have at most
+one active receiving policy. If no policy is configured, the CFP applies its
+default receiving policy (Section 10.6.5).
+
+```json
+{
+  "agent_id": "utap:agent:cloudco.com:billing-agent",
+  "receiving_limits": {
+    "per_transaction": {
+      "value": "5000.00",
+      "currency": "USD"
+    },
+    "per_day": {
+      "value": "50000.00",
+      "currency": "USD"
+    },
+    "per_month": {
+      "value": "500000.00",
+      "currency": "USD"
+    }
+  },
+  "received": {
+    "today": {
+      "value": "12000.00",
+      "currency": "USD"
+    },
+    "this_month": {
+      "value": "87000.00",
+      "currency": "USD"
+    }
+  },
+  "counterparty_policy": {
+    "mode": "allowlist",
+    "entries": [
+      "utap:agent:acme.com:*",
+      "utap:agent:bigcorp.com:procurement-*"
+    ]
+  },
+  "accepted_purposes": ["compute", "api-access", "data-license"],
+  "velocity": {
+    "max_transfers_per_minute": 10,
+    "max_unique_counterparties_per_hour": 25
+  },
+  "requires_review_above": {
+    "value": "10000.00",
+    "currency": "USD"
+  },
+  "settlement_delay_seconds": 0,
+  "created_at": "2026-01-15T00:00:00Z",
+  "updated_at": "2026-02-26T10:00:00Z"
+}
+```
+
+#### 10.6.2 Receiving Limit Enforcement
+
+The CFP MUST enforce receiving limits at **transfer time** -- when the PA calls
+`POST /cfp/v1/tokens/{id}/transfer`. This is the mirror of RA-side budget
+enforcement at mint time (Section 10.3).
+
+**Enforcement sequence:**
+
+1. PA requests transfer of a validated token.
+2. CFP resolves the PA's receiving policy.
+3. CFP checks:
+   - `per_transaction` limit against the token amount.
+   - `per_day` limit against `received.today` + token amount.
+   - `per_month` limit against `received.this_month` + token amount.
+4. CFP checks the token's `purpose` against `accepted_purposes`. If the
+   purpose is not in the list, the transfer is rejected.
+5. If `requires_review_above` is exceeded, the transfer is placed in a `HELD`
+   state and the PA's controlling Principal is notified (Section 8.10).
+6. If all checks pass, the CFP executes the transfer and increments
+   `received` counters.
+
+**Receiving limit debit is atomic with the transfer.** If the transfer fails,
+the counters are not incremented. If a transfer is later reversed (during the
+settlement delay window), the counters are decremented.
+
+#### 10.6.3 Counterparty Policy
+
+The `counterparty_policy` controls which RAs a PA will accept transfers from.
+
+| Mode        | Behavior                                                    |
+|-------------|-------------------------------------------------------------|
+| `allowlist` | Only RAs matching an entry may transfer to this PA.         |
+| `denylist`  | All RAs may transfer except those matching an entry.        |
+| `open`      | Any RA may transfer. This is the default.                   |
+
+Entries support wildcard matching on the local-id segment:
+
+- `utap:agent:acme.com:*` -- any agent within `acme.com`.
+- `utap:agent:acme.com:procurement-*` -- agents with the prefix `procurement-`
+  within `acme.com`.
+- `utap:agent:acme.com:purchasing-bot-7` -- exact match.
+
+The CFP MUST evaluate counterparty policy before executing a transfer. If the
+RA does not match the policy, the CFP MUST reject with `COUNTERPARTY_REJECTED`.
+
+#### 10.6.4 Velocity Controls
+
+Velocity controls detect anomalous inbound patterns that may indicate a
+compromised PA or credential-harvesting attack (Section 12.2.1).
+
+- `max_transfers_per_minute`: The CFP MUST reject transfers that would exceed
+  this rate with `VELOCITY_LIMIT_EXCEEDED`. The counter uses a sliding window.
+- `max_unique_counterparties_per_hour`: The CFP MUST reject transfers from a
+  new counterparty if the PA has already received from this many distinct RAs
+  within the past 60 minutes. Reject with `VELOCITY_LIMIT_EXCEEDED`.
+
+Velocity counters are maintained by the CFP and are not resettable by the PA.
+A Principal MAY reset them via the management API.
+
+#### 10.6.5 Default Receiving Policy
+
+If a PA has no explicit receiving policy, the CFP MUST apply a default policy.
+The default values are CFP-configurable but MUST NOT be unbounded. Recommended
+defaults:
+
+| Parameter                         | Default        |
+|-----------------------------------|----------------|
+| `per_transaction`                 | `10000.00 USD` |
+| `per_day`                         | `50000.00 USD` |
+| `per_month`                       | `500000.00 USD`|
+| `counterparty_policy.mode`        | `open`         |
+| `accepted_purposes`               | all            |
+| `max_transfers_per_minute`        | 30             |
+| `max_unique_counterparties_per_hour` | 100         |
+| `requires_review_above`           | none           |
+| `settlement_delay_seconds`        | 0              |
+
+The CFP MUST document its default receiving policy. Organizations MAY override
+any default at the PA or organizational level.
+
+#### 10.6.6 Settlement Delay
+
+When `settlement_delay_seconds` is greater than zero, transfers to this PA
+follow a hold-then-burn pattern:
+
+1. The transfer moves the token to `HELD` (not `TRANSFERRED`).
+2. A timer starts for the configured delay period.
+3. During this window:
+   - The RA or RA's Principal MAY cancel the transfer via
+     `POST /cfp/v1/tokens/{id}/cancel`. The token returns to `MINTED` and the
+     PA's receiving counters are decremented.
+   - A CFP administrator MAY cancel the transfer.
+4. After the delay expires without cancellation, the token moves to
+   `TRANSFERRED` and the normal burn/settlement flow continues.
+
+This gives defenders a response window against a compromised PA without
+affecting the experience for legitimate transactions processed within the delay
+period.
+
+#### 10.6.7 Receiving Policy Management API
+
+**Query receiving policy:**
+
+```http
+GET /cfp/v1/receiving-policy/utap:agent:cloudco.com:billing-agent HTTP/1.1
+Host: cfp.example.com
+Authorization: Bearer <agent-jwt>
+```
+
+**Create or update receiving policy (PA's principal only):**
+
+```http
+PUT /cfp/v1/receiving-policy/utap:agent:cloudco.com:billing-agent HTTP/1.1
+Host: cfp.example.com
+Authorization: Bearer <principal-jwt>
+Content-Type: application/json
+
+{
+  "receiving_limits": {
+    "per_transaction": { "value": "5000.00", "currency": "USD" },
+    "per_day": { "value": "50000.00", "currency": "USD" },
+    "per_month": { "value": "500000.00", "currency": "USD" }
+  },
+  "counterparty_policy": {
+    "mode": "allowlist",
+    "entries": ["utap:agent:acme.com:*"]
+  },
+  "accepted_purposes": ["compute", "api-access", "data-license"],
+  "velocity": {
+    "max_transfers_per_minute": 10,
+    "max_unique_counterparties_per_hour": 25
+  },
+  "requires_review_above": { "value": "10000.00", "currency": "USD" },
+  "settlement_delay_seconds": 900
+}
+```
+
+**Response:**
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "agent_id": "utap:agent:cloudco.com:billing-agent",
+  "status": "updated",
+  "effective_at": "2026-02-27T12:00:00Z"
+}
+```
+
+**Rejection due to receiving limit:**
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{
+  "error": {
+    "code": "RECEIVING_LIMIT_EXCEEDED",
+    "message": "Daily receiving limit exceeded for PA utap:agent:cloudco.com:billing-agent",
+    "receiving_limit": { "value": "50000.00", "currency": "USD" },
+    "received": { "value": "48000.00", "currency": "USD" },
+    "requested": { "value": "5000.00", "currency": "USD" },
+    "retry": false
+  }
+}
+```
+
 ---
 
 ## 11. Idempotency Mechanism
@@ -1988,7 +2217,8 @@ The only attack on an intercepted credential is **replay** -- using it as-is.
 - **HTTPS:** Transport encryption prevents interception.
 - **Transfer authorization:** The CFP requires the PA to authenticate before
   executing a transfer. Possessing a credential alone is not sufficient to
-  steal funds -- the attacker would also need a valid PA JWT.
+  steal funds -- the attacker would also need a valid PA JWT. However, this
+  control does NOT protect against a compromised PA (see Section 12.2.1).
 
 **HMAC key management:**
 
@@ -1998,6 +2228,74 @@ The only attack on an intercepted credential is **replay** -- using it as-is.
   credentials signed with both the current and previous key for a grace
   period matching the maximum token TTL (default: 1 hour).
 - Key rotation MUST NOT invalidate tokens already in flight.
+
+#### 12.2.1 Compromised Providing Agent (PA-Side Fraud)
+
+The mitigations above assume the PA is honest. If an attacker compromises a
+legitimate PA -- gaining access to its JWT and endpoint -- the threat model
+changes materially. The compromised PA already possesses the one thing an
+external attacker lacks: a valid authentication session with the CFP.
+
+**Attack surface:**
+
+- **Token draining:** The compromised PA can accept any credential presented to
+  it and immediately call `POST /cfp/v1/tokens/validate` followed by
+  `POST /cfp/v1/tokens/{id}/transfer`, redirecting funds to an account it
+  controls.
+- **Silent acceptance:** The PA can ACK goods or services it never delivered,
+  causing the token to burn and the RA's funds to settle to the PA.
+- **Credential harvesting:** If the PA receives credentials over a non-HTTPS
+  transport (Section 14.5), it could stockpile credentials and batch-drain
+  them before detection.
+
+**Protocol-level mitigations:**
+
+- **Amount capping:** The RA SHOULD mint tokens for the exact amount required,
+  never more. Purpose binding (Section 6.3) constrains acceptable spending
+  categories. Budget enforcement (Section 10) limits per-transaction and
+  per-period exposure. Together these cap the blast radius of any single
+  compromised PA.
+- **Short TTL:** The default 1-hour expiry limits the window during which
+  harvested credentials remain usable.
+- **Single-use burn:** Each token can only be transferred once. A compromised PA
+  cannot replay a credential -- after transfer the token is BURNED.
+- **Audit trail detection:** Every transfer is recorded in the hash-chained
+  audit ledger (Section 9). Anomalous patterns -- e.g., a PA that validates
+  and transfers every token within seconds, or a PA receiving funds far above
+  its historical baseline -- are detectable through audit queries and
+  automated monitoring.
+
+**PA-side receiving policy (normative -- see Section 10.6):**
+
+The protocol enforces symmetric controls on the receiving side:
+
+- **Receiving limits:** Per-transaction, per-day, and per-month caps on inbound
+  value, enforced at transfer time (Section 10.6.2).
+- **Counterparty policy:** Allowlist or denylist restricting which RAs may
+  transfer to this PA, with wildcard matching (Section 10.6.3).
+- **Velocity controls:** Rate limits on transfers per minute and unique
+  counterparties per hour, detecting credential-harvesting patterns
+  (Section 10.6.4).
+- **Settlement delay:** Configurable hold-then-burn window during which a
+  transfer can be cancelled by the RA or an administrator (Section 10.6.6).
+- **Review threshold:** Transfers above a configurable amount require Principal
+  approval before completing (Section 10.6.2).
+
+**Additional CFP-level mitigations (implementation guidance):**
+
+- **PA re-authentication:** For transfers above a configurable threshold, the
+  CFP SHOULD require the PA to re-authenticate or present a fresh delegation
+  chain, limiting the utility of a stolen long-lived JWT.
+- **Alerting:** The CFP SHOULD emit real-time alerts on high-value transfers,
+  failed HMAC validations from a single PA, and sudden changes in PA
+  transaction patterns.
+
+**Residual risk:** A compromised PA with a valid JWT can drain at least one
+token before any reactive control fires. This is inherent to any bearer-token
+system where the recipient is trusted at the protocol level. The protocol
+bounds this risk through amount capping, TTL, and single-use semantics, but
+cannot eliminate it entirely. Organizations SHOULD treat PA credentials with
+the same security posture as payment-processing keys.
 
 ### 12.3 Agent Authentication Security
 
@@ -2126,6 +2424,8 @@ The `retry` field indicates whether the client SHOULD retry the request. The
 | 401  | `UNAUTHORIZED`          | No    | Missing, expired, or invalid JWT                 |
 | 403  | `FORBIDDEN`             | No    | Valid JWT but insufficient permissions           |
 | 403  | `BUDGET_EXCEEDED`       | No    | Transaction exceeds budget scope limits          |
+| 403  | `RECEIVING_LIMIT_EXCEEDED`| No  | Transfer exceeds PA's receiving limit (10.6)     |
+| 403  | `COUNTERPARTY_REJECTED` | No    | RA not permitted by PA's counterparty policy (10.6) |
 | 403  | `PURPOSE_NOT_ALLOWED`   | No    | Purpose category not in agent's allowed list     |
 | 403  | `DELEGATION_INVALID`    | No    | Delegation chain verification failed             |
 | 404  | `TOKEN_NOT_FOUND`       | No    | Token ID does not exist                          |
@@ -2140,6 +2440,7 @@ The `retry` field indicates whether the client SHOULD retry the request. The
 | 410  | `TOKEN_REVOKED`         | No    | Token was revoked                                |
 | 413  | `AMOUNT_TOO_LARGE`      | No    | Amount exceeds system or per-transaction limits  |
 | 429  | `RATE_LIMITED`          | Yes   | Too many requests; see `Retry-After` header      |
+| 429  | `VELOCITY_LIMIT_EXCEEDED`| Yes  | PA velocity control triggered (10.6); see `Retry-After` |
 | 500  | `INTERNAL_ERROR`        | Yes   | CFP internal error                               |
 | 503  | `SERVICE_BUSY`          | Yes   | CFP at capacity; see `Retry-After` header        |
 
