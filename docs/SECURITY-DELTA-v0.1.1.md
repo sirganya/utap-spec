@@ -1,306 +1,233 @@
-# UTAP v0.1.1 Security Hardening Delta (Normative Patch)
+# UTAP v0.1.1 Security Delta (Applied Change Map)
 
-**Status:** Proposed  
-**Applies to:** `UTAP-v0.1.md` (v0.1.0 draft)  
-**Goal:** Close high-impact security gaps while preserving UTAP architecture and flows.  
-**Companion rationale (non-normative):** `docs/SECURITY-RATIONALE-v0.1.1.md`
+This document captures the applied v0.1.1 security changes to `UTAP-v0.1.md`, with minimal explanatory rewrites and a single centralized profile exception description.
 
 ---
 
-## 0. Executive Summary
+## Global metadata
 
-This delta introduces:
-
-1. **Recipient binding** (`intended_payee`) to prevent cross-PA token theft.
-2. **Atomic claim endpoint** to remove validate→hold race windows.
-3. **Stronger transport confidentiality requirements** for bearer credentials.
-4. **Clock/skew policy** for deterministic expiry/auth behavior.
-5. **Validation error-surface hardening** and stronger anti-enumeration throttling.
-6. **Idempotency scope clarification** to prevent cross-tenant collisions.
-7. **Credential leakage controls** for URI query deployments.
-8. **Lifecycle/schema consistency fixes** (`PENDING_APPROVAL` in schema).
-9. Optional **PoP profile** for stronger credential possession assurance.
-10. **Security profile matrix** for deployment clarity.
+- `Version` → `0.1.1`
+- `Document ID` → `UTAP-SPEC-0.1.1`
+- End marker updated to v0.1.1
 
 ---
 
-## 1) Recipient Binding (Critical)
+## Section 2 (Terminology)
 
-### 1.1 New Token Field
+- **Token Credential** definition updated to include optional `intended_payee` in credential inputs.
 
-Add a token field:
+---
 
-- `intended_payee` (string, AID or AID wildcard pattern)
+## Section 5 (Identity / JWT)
 
-If present, it binds a token to one PA identity (or constrained PA set).
+- Added `nbf` claim to JWT claim table and example payload.
 
-### 1.2 Normative Requirements
+---
 
-- The CFP **MUST** enforce `intended_payee` at claim/hold/transfer time.
-- If the authenticated PA does not match, CFP **MUST** reject with:
-  - HTTP `403`
-  - `PAYEE_MISMATCH`
-- The PA identity used for matching **MUST** come from CFP-authenticated JWT context, not request body.
+## Section 6 (Token Specification)
 
-### 1.3 Credential Construction Update (Section 6.4)
+### 6.1 Token format
 
-Update canonical input:
+- Added `intended_payee` to token example and field definitions.
+
+### 6.4 Credential construction
+
+- HMAC input updated:
 
 ```text
-credential_input =
-  token_id || owner_aid || amount || currency || timestamp || nonce || intended_payee
+credential_input = token_id || owner_aid || amount || currency || timestamp || nonce || intended_payee
 ```
 
-Canonicalization rule:
-- If `intended_payee` absent: use empty string (`""`) in that position.
+- Canonicalization rule added: if `intended_payee` is absent, use `""`.
+- Mint/verify pseudocode updated for `intended_payee`.
+- Versioned verifier behavior clarified:
+  - `utap-0.1` → legacy input (no `intended_payee`)
+  - `utap-0.1.1` → input includes `intended_payee`
 
-### 1.4 Schema / Examples
+### 6.8 Recipient Binding (`intended_payee`) (new)
 
-- Add `intended_payee` to token schema and examples.
-- Add pattern consistent with AID format used in Section 5.
-
----
-
-## 2) Atomic Claim Endpoint (Critical)
-
-### 2.1 New Endpoint
-
-Add endpoint to Section 14.3:
-
-- `POST /cfp/v1/tokens/claim`
-
-### 2.2 Request
-
-```json
-{
-  "credential": "<base64url-hmac>",
-  "expected_amount": { "value": "1500.00", "currency": "USD" },
-  "expected_purpose": "compute",
-  "claim_ttl_seconds": 300
-}
-```
-
-### 2.3 Behavior
-
-CFP **MUST** perform, atomically, in one serializable transaction:
-
-1. Credential verification
-2. Token state checks
-3. Policy checks (including `intended_payee`)
-4. Transition to `HELD` bound to presenting PA
-5. Hold expiry assignment
-6. Audit record write
-
-Concurrent claims for same token **MUST** result in exactly one success.
-
-### 2.4 Error Behavior
-
-- Losers in race: `TOKEN_ALREADY_CLAIMED` or `TOKEN_STATE_CONFLICT`
-- Hold timeout: `HOLD_EXPIRED`
+- CFP MUST enforce recipient binding on claim/hold/transfer.
+- Matching identity MUST come from authenticated JWT context.
+- Mismatch MUST return:
+  - HTTP `403`
+  - `PAYEE_MISMATCH`
 
 ---
 
-## 3) Transport Confidentiality Tightening (Critical)
+## Section 7 (URI)
 
-### 3.1 Agent-to-Agent Credential Transport
-
-Update Section 14.1/14.5 language:
-
-- Production credential exchange **MUST** use encrypted transport.
-- Non-confidential transport allowed only in explicitly configured `HIGH_RISK_PROFILE` mode.
-
-### 3.2 HIGH_RISK_PROFILE Requirements
-
-If using QR/SMS/plain channels, deployment **MUST** enforce all:
-
-- Token TTL ≤ 120 seconds
-- Immediate `POST /tokens/claim` on receipt
-- Replay anomaly detection and alerting enabled
-- Explicit operator acknowledgement of elevated risk
-
-### 3.3 Logging and Telemetry
-
-- Systems **MUST** redact `utap_credential` from logs, traces, metrics labels, crash reports, and analytics sinks.
+- URI examples updated to `utap_version=0.1.1`.
+- Query exposure controls added:
+  - Prefer header/body placement when URI alteration is not required.
+  - If query is used, MUST redact `utap_credential` from logs/telemetry sinks.
+  - MUST prevent outbound leakage via `Referer`.
 
 ---
 
-## 4) Clock Drift / Time Authority Policy (High)
+## Section 8 (Protocol Flows)
 
-### 4.1 CFP Time Requirements
+### 8.2 Minting
 
-- CFP nodes **MUST** use authenticated NTP (or equivalent secure sync).
-- Inter-node skew **MUST NOT** exceed 2 seconds.
-- Health checks **MUST** alarm and optionally fail closed if skew exceeds policy.
+- Request/response examples include `intended_payee`.
+- Validation rules include `intended_payee` validity check.
 
-### 4.2 JWT and Expiry Leeway
+### 8.4 Validation
 
-- JWT `iat/nbf/exp` validation **MUST** apply bounded leeway (RECOMMENDED ±30s).
-- Token expiry (`expires_at`) decisions **MUST** use CFP authoritative server time.
-- Client clocks **MUST NOT** be trusted for security decisions.
+- Clarified presenting PA identity must come from JWT context (not request body).
+- Added `PAYEE_MISMATCH` behavior.
+- Added validation error-surface hardening note.
 
-### 4.3 Timestamp Precision Clarification
+### 8.4.1 Atomic Claim (new)
 
-- Business timestamps MAY remain second-level ISO8601.
-- Security-critical ordering/checks **MUST** use server-side monotonic/authoritative time.
+- Added endpoint:
+  - `POST /cfp/v1/tokens/claim`
+- Claim request fields:
+  - `credential`
+  - `expected_amount`
+  - `expected_purpose`
+  - `claim_ttl_seconds`
+- Must execute atomically in one serializable transaction:
+  1. Credential verification
+  2. Token state checks
+  3. Policy checks (including `intended_payee`)
+  4. Transition to `HELD` bound to authenticated PA
+  5. Hold expiry assignment
+  6. Audit write
+- Concurrent claims must yield exactly one success.
+- Losing races must return `CLAIM_CONFLICT` or `TOKEN_STATE_CONFLICT`.
+- Expired hold behavior returns `HOLD_EXPIRED`.
 
----
+### 8.5 Hold / 8.6 Transfer
 
-## 5) Validation Oracle and Enumeration Hardening (Medium-High)
-
-### 5.1 Error Surface
-
-For credential validation/claim failures, CFP **SHOULD** minimize distinguishability between:
-
-- malformed credential
-- unknown credential
-- credential for non-transferable token
-
-Where feasible, return uniform error shape and similar latency class.
-
-### 5.2 Rate Limits (Normative)
-
-CFP **MUST** enforce limits on `/tokens/validate` and `/tokens/claim`:
-
-- per-agent
-- per-source-IP / subnet
-- burst + sustained windows
-
-On repeated failures, CFP **SHOULD** apply progressive backoff and emit security alerts.
+- Added recipient binding enforcement on hold and transfer (`PAYEE_MISMATCH`).
 
 ---
 
-## 6) Idempotency Key Scope Clarification (Medium)
+## Section 11 (Idempotency)
 
-### 6.1 Canonical Scope
+### 11.3 Scope clarification
 
-Idempotency uniqueness **MUST** be keyed by:
+- Idempotency uniqueness now MUST be keyed by:
 
 ```text
 (agent_id, endpoint, idempotency_key, canonical_request_hash)
 ```
 
-### 6.2 Conflict Rules
+- Same key+agent+endpoint with different payload hash → `INVALID_IDEMPOTENCY` (400).
+- Same key string from different agents MUST NOT collide.
 
-- Same tuple replay: return cached response.
-- Same `(agent_id, endpoint, idempotency_key)` but different payload hash:
-  - `INVALID_IDEMPOTENCY` (400)
-- Same key string from different agents **MUST NOT** collide.
+### 11.4 Retry vs conflict behavior
 
----
-
-## 7) Query-String Exposure Controls (Medium)
-
-### 7.1 Preferred Placement
-
-For HTTP integrations, credential transport in header/body **SHOULD** be preferred over query string where possible.
-
-### 7.2 If Query Is Used
-
-Deployments **MUST** enforce:
-
-- Access log redaction of `utap_credential`
-- Reverse proxy/WAF redaction
-- Referrer policy preventing outbound credential leak
-- No credential ingestion into analytics tooling
+- Clarified retry handling using tuple semantics + token state checks.
 
 ---
 
-## 8) Lifecycle / Schema Consistency Fixes (Correctness)
+## Section 12 (Security)
 
-### 8.1 Token Status Enum Alignment
+### 12.2 Token credential security
 
-Appendix B token `status` enum **MUST** include `PENDING_APPROVAL` to match Section 6.2.
+- Core attribute list updated to include `intended_payee`.
 
-### 8.2 Cross-Section Consistency
+### 12.2.1 Compromised PA
 
-Any new endpoint/state/error introduced by this delta **MUST** be reflected in:
+- Attack/mitigation text aligned with claim endpoint and recipient binding.
 
-- Section 13 error table
-- Section 14 endpoint summary
-- Appendix B JSON schemas
-- Worked examples
+### 12.3 Agent auth security
 
----
+- JWT validation requirement now explicitly includes `iat`/`nbf`/`exp` bounded leeway.
 
-## 9) Optional Proof-of-Possession Profile (Optional Hardening)
+### 12.7 Rate limiting
 
-Introduce optional `POP_CLAIM` profile:
+- CFP MUST enforce limits on:
+  - `/cfp/v1/tokens/validate`
+  - `/cfp/v1/tokens/claim`
+- Required dimensions:
+  - per-agent
+  - per-source-IP/subnet
+  - burst + sustained windows
+- Repeated failures SHOULD trigger progressive backoff + security alerts.
 
-- PA includes signed nonce in `POST /tokens/claim`.
-- CFP verifies signature against PA registered public key and nonce freshness.
+### 12.9 Time authority and clock skew (new)
 
-Purpose: reduce usefulness of stolen bearer credential in transit/log leaks.
+- CFP nodes MUST use authenticated NTP (or equivalent secure sync).
+- Inter-node skew MUST NOT exceed 2 seconds.
+- JWT `iat/nbf/exp` checks MUST use bounded leeway (recommended ±30s).
+- Token expiry MUST use CFP authoritative server time.
+- Client clocks MUST NOT be trusted for security decisions.
+- Security-critical ordering MUST use authoritative/monotonic server time.
 
-**Note:** Optional in v0.1.1; candidate default in v0.2.
+### 12.10 Validation error surface (new)
 
----
+- CFP SHOULD minimize distinguishability of malformed/unknown/non-transferable validation failures.
 
-## 10) Security Profile Matrix (New Section)
+### 12.11 Security profiles (new)
 
-Define explicit profiles:
+- Profiles defined: `STRICT`, `COMPAT`, `HIGH_RISK_PROFILE`.
+- `STRICT` (recommended): recipient binding + atomic claim + encrypted exchange + redaction.
+- `COMPAT`: migration mode (including tokens without `intended_payee`) with published migration deadline.
+- `HIGH_RISK_PROFILE`: non-confidential channels permitted only with:
+  - TTL ≤ 120 seconds
+  - immediate claim
+  - replay anomaly alerting
+  - explicit operator risk acknowledgement
 
-### STRICT (Recommended default)
-- Recipient binding enabled
-- Atomic claim required
-- Encrypted agent-to-agent transport only
-- Credential redaction controls enabled
-- Short TTL (≤ 10 min; 1–5 min preferred for high-value)
+> Production vs non-production/channel exception behavior is centralized here.
 
-### COMPAT
-- Legacy behavior for migration
-- No recipient binding (temporary)
-- Must publish migration deadline
+### 12.12 Optional PoP profile (new)
 
-### HIGH_RISK_PROFILE
-- Allows non-confidential transport (QR/SMS/etc.)
-- Requires strict TTL, immediate claim, and elevated monitoring
-
----
-
-## 11) Error Code Additions
-
-Add to Section 13.2:
-
-| HTTP | UTAP Code              | Retry | Description |
-|------|------------------------|-------|-------------|
-| 403  | `PAYEE_MISMATCH`       | No    | Authenticated PA does not match `intended_payee` |
-| 409  | `CLAIM_CONFLICT`       | Yes   | Concurrent claim in progress/just completed |
-| 400  | `INVALID_CLAIM_REQUEST`| No    | Claim request malformed or violates constraints |
-
-(Implementations may map `CLAIM_CONFLICT` to existing `TOKEN_STATE_CONFLICT` if desired.)
+- Optional `POP_CLAIM` profile: PA signs nonce in claim; CFP verifies signature and freshness.
 
 ---
 
-## 12) Minimal Patch Checklist
+## Section 13 (Error Codes)
 
-- [ ] Add `intended_payee` field definitions and schema.
-- [ ] Update HMAC input canonicalization text and pseudocode.
-- [ ] Add `/cfp/v1/tokens/claim` flow + endpoint summary.
-- [ ] Add `PAYEE_MISMATCH` and claim-related errors.
-- [ ] Tighten transport text from MAY/SHOULD to production MUSTs.
-- [ ] Add NTP/skew and JWT/expiry leeway requirements.
-- [ ] Add validation/claim rate-limit requirements.
-- [ ] Clarify idempotency scope tuple.
-- [ ] Enforce query redaction controls.
-- [ ] Fix schema enum to include `PENDING_APPROVAL`.
+Added:
+
+- `INVALID_CLAIM_REQUEST` (400)
+- `PAYEE_MISMATCH` (403)
+- `CLAIM_CONFLICT` (409)
 
 ---
 
-## 13) Rationale
+## Section 14 (Transport Binding)
 
-These changes preserve UTAP’s core design (CFP authority, single-use tokens, auditable lifecycle) while closing the most consequential practical risk: **theft/front-running of valid bearer credentials by unintended but authenticated participants**.
+### 14.1 Transport policy
+
+- Preserved original replay-focused explanatory structure.
+- Tightened requirement: agent-to-agent credential exchange MUST be encrypted.
+- Added credential redaction requirement.
+
+### 14.3 Endpoint summary
+
+- Added `POST /cfp/v1/tokens/claim`.
+
+### 14.5 transport subsections
+
+- Flow references updated to include claim.
+- Queue/gRPC/MQTT transport requirements tightened for encrypted transport.
 
 ---
 
-## 14) Backward Compatibility Notes
+## Section 15 (Worked Examples)
 
-- Existing tokens without `intended_payee` remain valid under COMPAT profile.
-- New security-sensitive deployments should require STRICT profile.
-- Endpoint addition (`/tokens/claim`) is additive and non-breaking.
-- HMAC canonicalization change requires versioning (`utap-0.1.1`) to avoid mixed-verifier ambiguity.
+- Version literals updated to `0.1.1`.
+- Main flow updated to use atomic claim (`mint → claim → transfer → burn`).
+- Added `intended_payee` in mint-related examples.
 
 ---
 
-## 15) Versioning Recommendation
+## Appendix B (Schemas)
 
-Given credential input changes, bump protocol version identifier from `utap-0.1` to `utap-0.1.1` and require verifiers to branch by token `version` when recomputing HMAC.
+- Schema IDs updated to `v0.1.1`.
+- Token schema:
+  - `version` const → `utap-0.1.1`
+  - add `intended_payee` pattern/description
+  - include `PENDING_APPROVAL` in status enum
+- Delegation schema version const → `0.1.1`
+
+---
+
+## Compatibility and migration note
+
+- Existing tokens without `intended_payee` remain valid under `COMPAT` during migration.
+- Verifiers branch HMAC recomputation by token `version`.
